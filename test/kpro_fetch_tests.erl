@@ -18,6 +18,7 @@
 -include("kpro_private.hrl").
 
 -define(TOPIC, kpro_test_lib:get_topic()).
+-define(TOPIC_LAT, kpro_test_lib:get_topic_lat()).
 -define(PARTI, 0).
 -define(TIMEOUT, 5000).
 
@@ -26,16 +27,22 @@
 -define(RAND_KAFKA_VALUE_BYTES, 1024).
 
 fetch_test_() ->
-  {Min, Max} = get_api_vsn_range(),
+  {Min, Max} = get_api_vsn_range(?TOPIC),
   [{"version " ++ integer_to_list(V),
-    fun() -> with_vsn(V) end} || V <- lists:seq(Min, Max)].
+    fun() -> with_vsn_topic(V, ?TOPIC) end} || V <- lists:seq(Min, Max)].
+
+fetch_lat_test_() ->
+  {Min, Max} = get_api_vsn_range(?TOPIC_LAT),
+  [{"version " ++ integer_to_list(V),
+    fun() -> with_vsn_topic(V, ?TOPIC_LAT) end} || V <- lists:seq(Min, Max)].
 
 incremental_fetch_test() ->
-  {_Min, Max} = get_api_vsn_range(),
+  {_Min, Max} = get_api_vsn_range(?TOPIC),
   case Max >= 7 of
     true ->
       with_connection(
         random_config(),
+        ?TOPIC,
         fun(Conn) -> test_incemental_fetch(Conn, Max) end);
     false -> ok
   end.
@@ -63,15 +70,15 @@ test_incemental_fetch(Connection, Vsn) ->
                                 , session_id := SessionId
                                 }}, Rsp1).
 
-fetch_and_verify(_Connection, _Vsn, _BeginOffset, []) -> ok;
-fetch_and_verify(Connection, Vsn, BeginOffset, Messages) ->
-  Batch0 = do_fetch(Connection, Vsn, BeginOffset, rand_num(1000)),
+fetch_and_verify(_Connection, _Topic, _Vsn, _BeginOffset, []) -> ok;
+fetch_and_verify(Connection, Topic, Vsn, BeginOffset, Messages) ->
+  Batch0 = do_fetch(Connection, Topic, Vsn, BeginOffset, rand_num(1000)),
   Batch = drop_older_offsets(BeginOffset, Batch0),
   [#kafka_message{offset = FirstOffset} | _] = Batch,
   ?assertEqual(FirstOffset, BeginOffset),
   Rest = validate_messages(Batch, Messages),
   #kafka_message{offset = NextBeginOffset} = lists:last(Batch),
-  fetch_and_verify(Connection, Vsn, NextBeginOffset + 1, Rest).
+  fetch_and_verify(Connection, Topic, Vsn, NextBeginOffset + 1, Rest).
 
 %% kafka 0.9 may return messages having offset less than requested
 %% in case the requested offset is in the middle of a compressed batch
@@ -93,14 +100,16 @@ validate_message(undefined, _T, K, V, #{key := K, value := V}) -> ok;
 validate_message(create, -1, K, V, #{key := K, value := V}) -> ok;
 % message produced with matching create timestamp
 validate_message(create, T, K, V, #{ts := T, key := K, value := V}) -> ok;
+% message produced with create timestamp which differs from the fetched log append timestamp
+validate_message(append, TF, K, V, #{ts := TP, key := K, value := V}) when TF /= TP -> ok;
 % something unexpected
 validate_message(TType, T, K, V, Wat) ->
   erlang:error(#{ fetched => {TType, T, K, V}
                 , produced => Wat
                 }).
 
-do_fetch(Connection, Vsn, BeginOffset, MaxBytes) ->
-  Req = make_req(Vsn, BeginOffset, MaxBytes),
+do_fetch(Connection, Topic, Vsn, BeginOffset, MaxBytes) ->
+  Req = make_req(Vsn, Topic, BeginOffset, MaxBytes),
   {ok, Rsp} = kpro:request_sync(Connection, Req, ?TIMEOUT),
   #{ header := Header
    , batches := Batches
@@ -111,26 +120,27 @@ do_fetch(Connection, Vsn, BeginOffset, MaxBytes) ->
   end,
   case Batches of
     ?incomplete_batch(Size) ->
-      do_fetch(Connection, Vsn, BeginOffset, Size);
+      do_fetch(Connection, Topic, Vsn, BeginOffset, Size);
     _ ->
       lists:append([Msgs || {_Meta, Msgs} <- Batches])
   end.
 
-with_vsn(Vsn) ->
+with_vsn_topic(Vsn, Topic) ->
   with_connection(
     random_config(),
+    Topic,
     fun(Connection) ->
-        {BaseOffset, Messages} = produce_randomly(Connection),
-        fetch_and_verify(Connection, Vsn, BaseOffset, Messages)
+        {BaseOffset, Messages} = produce_randomly(Connection, Topic),
+        fetch_and_verify(Connection, Topic, Vsn, BaseOffset, Messages)
     end).
 
-produce_randomly(Connection) ->
-  produce_randomly(Connection, rand_num(?RAND_PRODUCE_BATCH_COUNT), []).
+produce_randomly(Connection, Topic) ->
+  produce_randomly(Connection, Topic, rand_num(?RAND_PRODUCE_BATCH_COUNT), []).
 
-produce_randomly(_Connection, 0, Acc0) ->
+produce_randomly(_Connection, _Topic, 0, Acc0) ->
   [{BaseOffset, _} | _] = Acc = lists:reverse(Acc0),
   {BaseOffset, lists:append([Msg || {_, Msg} <- Acc])};
-produce_randomly(Connection, Count, Acc) ->
+produce_randomly(Connection, Topic, Count, Acc) ->
   {ok, Versions} = kpro:get_api_versions(Connection),
   {MinVsn, MaxVsn} = maps:get(produce, Versions),
   Vsn = case MinVsn =:= MaxVsn of
@@ -139,12 +149,12 @@ produce_randomly(Connection, Count, Acc) ->
         end,
   Opts = rand_produce_opts(),
   Batch = make_random_batch(rand_num(?RAND_BATCH_SIZE)),
-  Req = kpro_req_lib:produce(Vsn, ?TOPIC, ?PARTI, Batch, Opts),
+  Req = kpro_req_lib:produce(Vsn, Topic, ?PARTI, Batch, Opts),
   {ok, Rsp} = kpro:request_sync(Connection, Req, ?TIMEOUT),
   #{ error_code := no_error
    , base_offset := Offset
    } = kpro_test_lib:parse_rsp(Rsp),
-  produce_randomly(Connection, Count - 1, [{Offset, Batch} | Acc]).
+  produce_randomly(Connection, Topic, Count - 1, [{Offset, Batch} | Acc]).
 
 rand_produce_opts() ->
   #{ compression => rand_element([no_compression, gzip, snappy])
@@ -155,11 +165,11 @@ rand_num(N) -> (os:system_time() rem N) + 1.
 
 rand_element(L) -> lists:nth(rand_num(length(L)), L).
 
-make_req(Vsn, Offset, MaxBytes) ->
+make_req(Vsn, Topic, Offset, MaxBytes) ->
   Opts = #{ max_wait_time => 500
           , max_bytes => MaxBytes
           },
-  kpro_req_lib:fetch(Vsn, ?TOPIC, ?PARTI, Offset, Opts).
+  kpro_req_lib:fetch(Vsn, Topic, ?PARTI, Offset, Opts).
 
 random_config() ->
   Configs0 =
@@ -172,21 +182,21 @@ random_config() ->
             end,
   rand_element(Configs).
 
-get_api_vsn_range() ->
+get_api_vsn_range(Topic) ->
   Config = kpro_test_lib:connection_config(plaintext),
   {ok, Versions} =
-    with_connection(Config, fun(Pid) -> kpro:get_api_versions(Pid) end),
+    with_connection(Config, Topic, fun(Pid) -> kpro:get_api_versions(Pid) end),
   maps:get(fetch, Versions).
 
-with_connection(Config, Fun) ->
+with_connection(Config, Topic, Fun) ->
   ConnFun =
     fun(Endpoints, Cfg) ->
-        kpro:connect_partition_leader(Endpoints, Cfg, ?TOPIC, ?PARTI)
+        kpro:connect_partition_leader(Endpoints, Cfg, Topic, ?PARTI)
     end,
   kpro_test_lib:with_connection(Config, ConnFun, Fun).
 
 make_random_batch(Count) ->
-  [#{ ts => kpro_lib:now_ts()
+  [#{ ts => kpro_lib:now_ts() - 1
     , key => uniq_bin()
     , value => rand_bin()
     } || _ <- lists:seq(1, Count)].

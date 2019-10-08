@@ -55,12 +55,14 @@ create_topic() {
   TOPIC_NAME="$1"
   PARTITIONS="${2:-1}"
   REPLICAS="${3:-1}"
-  CMD="/opt/kafka/bin/kafka-topics.sh --zookeeper zookeeper --create --partitions $PARTITIONS --replication-factor $REPLICAS --topic $TOPIC_NAME"
+  EXTRA_OPTS="${*:2}"
+  CMD="/opt/kafka/bin/kafka-topics.sh --zookeeper zookeeper --create --partitions $PARTITIONS --replication-factor $REPLICAS --topic $TOPIC_NAME $EXTRA_OPTS"
   sudo docker exec $KAFKA_1 bash -c "$CMD"
 }
 
 create_topic "try-to-create-ignore-failure" || true
 create_topic "test-topic"
+create_topic "test-topic-lat" 1 1 --config message.timestamp.type=LogAppendTime
 
 # this is to warm-up kafka group coordinator for deterministic in tests
 sudo docker exec $KAFKA_1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --new-consumer --group test-group --describe > /dev/null 2>&1
