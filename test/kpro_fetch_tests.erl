@@ -82,13 +82,20 @@ drop_older_offsets(Offset, [#kafka_message{offset = O} | R] = ML) ->
   end.
 
 validate_messages([], Rest) -> Rest;
-validate_messages([#kafka_message{key = K, value = V} | R1], [Msg | R2]) ->
-  ok = validate_message(K, V, Msg),
+validate_messages([#kafka_message{ts_type = TType, ts = T, key = K, value = V} | R1],
+                  [Msg | R2]) ->
+  ok = validate_message(TType, T, K, V, Msg),
   validate_messages(R1, R2).
 
-validate_message(K, V, #{key := K, value := V}) -> ok;
-validate_message(K, V, Wat) ->
-  erlang:error(#{ fetched => {K, V}
+% message magic 0, no timestamp
+validate_message(undefined, _T, K, V, #{key := K, value := V}) -> ok;
+% message produced without create timestamp
+validate_message(create, -1, K, V, #{key := K, value := V}) -> ok;
+% message produced with matching create timestamp
+validate_message(create, T, K, V, #{ts := T, key := K, value := V}) -> ok;
+% something unexpected
+validate_message(TType, T, K, V, Wat) ->
+  erlang:error(#{ fetched => {TType, T, K, V}
                 , produced => Wat
                 }).
 
